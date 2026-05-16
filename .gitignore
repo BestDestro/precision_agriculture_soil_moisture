@@ -2,5 +2,13 @@ build/
 managed_components/
 backup/
 .vscode/
+.clangd
+.devcontainer/
+
 *.orig
 sdkconfig.old
+*.log
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini

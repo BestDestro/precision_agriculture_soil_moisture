@@ -1,0 +1,30 @@
+dependencies:
+  espressif/esp-modbus:
+    component_hash: 5d5e90b9e55721a8a194b301ad8102d4affb647f47b74cd413ff7d1ce2c1169c
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.18
+  idf:
+    source:
+      type: idf
+    version: 5.5.2
+  si5351:
+    component_hash: 045cbc025f60888c5ad846bb3dc802271faa30792852547c6f8ca9e8faa9ca54
+    dependencies: []
+    source:
+      git: https://github.com/hiperiondev/esp32-si5351.git
+      path: components/si5351
+      type: git
+    version: d0f4acd302e2c00e0931ce57ab06160bd9bf6a3b
+direct_dependencies:
+- espressif/esp-modbus
+- idf
+- si5351
+manifest_hash: 95f1505b7ebe14b45465eaf3fdf23aaa858116f6676ba48460e8efa5e4a2c9df
+target: esp32
+version: 2.0.0
