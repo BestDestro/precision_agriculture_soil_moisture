@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "app_main.cpp"
+        "frequency_sweep.cpp"
+        "humidity_model.cpp"
+        "humidity_sensor.cpp"
+        "model_data.cc"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_adc
+        si5351
+)
