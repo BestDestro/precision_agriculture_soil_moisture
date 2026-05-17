@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-import math
+import json
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import tensorflow as tf
-
-import train_json_model as base
 
 
 FREQUENCIES = [
@@ -23,7 +23,218 @@ EARLY_STOPPING_PATIENCE = 50
 LR_PATIENCE = 12
 RANDOM_SEED = 10
 
+JSON_PATH = Path("data.json")
+EXCLUDED_EXECUTION_INDICES: List[int] = list(range(64, 94))
+TEST_SIZE = 0.15
+VAL_SIZE = 0.15
 
+
+# Busca el fichero data.json en la carpeta actual.
+def resolve_json_path() -> Path:
+    configured = Path(JSON_PATH)
+    if configured.exists():
+        return configured
+    raise FileNotFoundError(f"No se encontro el dataset en {configured}")
+
+
+# Convierte un valor del JSON a float. None si el campo no existe.
+def _optional_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    return float(value)
+
+
+# Lee el porcentaje de perlita aplicado en una ejecucion.
+def perlite_percent_from_execution(execution: Dict) -> float:
+    return _optional_float(execution.get("perlita_porcentaje_sobre_tierra")) or 0.0
+
+
+# Calcula gramos de fosfato y ml de vinagre aplicados en una ejecucion.
+def chemical_amounts_from_execution(execution: Dict) -> Tuple[float, float]:
+    volume_used_l = _optional_float(execution.get("volumen_mezcla_utilizado_l")) or 0.0
+    phosphate_concentration_g_l = _optional_float(execution.get("concentracion_fosfato_g_l")) or 0.0
+    acidity_ratio = _optional_float(execution.get("proporcion_vinagre_en_mezcla")) or 0.0
+    phosphate_applied_g = max(0.0, volume_used_l * phosphate_concentration_g_l)
+    acidity_applied_ml = max(0.0, volume_used_l * acidity_ratio * 1000.0)
+    return float(phosphate_applied_g), float(acidity_applied_ml)
+
+
+# Carga los barridos validos y devuelve entradas, humedad, variables de split y grupo de ejecucion.
+def load_samples_from_json(
+    json_path: Path,
+    features: Sequence[str],
+    excluded_execution_indices: Optional[Iterable[int]] = None,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    excluded = set(excluded_execution_indices or [])
+
+    with open(json_path, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+
+    X: List[List[float]] = []
+    y_humidity: List[float] = []
+    y_perlite_percent: List[float] = []
+    y_phosphate_g: List[float] = []
+    y_acidity_ml: List[float] = []
+    groups: List[int] = []
+
+    for exec_idx, execution in enumerate(data):
+        if exec_idx in excluded:
+            continue
+
+        perlite_percent = perlite_percent_from_execution(execution)
+        phosphate_applied_g, acidity_applied_ml = chemical_amounts_from_execution(execution)
+
+        for barrido in execution.get("barridos", []):
+            row: List[float] = []
+            valid = True
+
+            for feat in features:
+                if feat not in barrido or barrido[feat] is None:
+                    valid = False
+                    break
+                row.append(float(barrido[feat]))
+
+            humidity = barrido.get("humedad")
+            if humidity is None:
+                valid = False
+
+            if not valid:
+                continue
+
+            humidity_v = float(humidity)
+            X.append(row)
+            y_humidity.append(humidity_v)
+            y_perlite_percent.append(perlite_percent)
+            y_phosphate_g.append(phosphate_applied_g)
+            y_acidity_ml.append(acidity_applied_ml)
+            groups.append(exec_idx)
+
+    return (
+        np.array(X, dtype=np.float32),
+        np.array(y_humidity, dtype=np.float32).reshape(-1, 1),
+        np.array(y_perlite_percent, dtype=np.float32).reshape(-1, 1),
+        np.array(y_phosphate_g, dtype=np.float32).reshape(-1, 1),
+        np.array(y_acidity_ml, dtype=np.float32).reshape(-1, 1),
+        np.array(groups, dtype=np.int32),
+    )
+
+
+# Crea una etiqueta por muestra para estratificar el split por ejecucion.
+# Separa ejecuciones con perlita, con quimicos y muestras sin mezcla.
+def build_split_stratification_labels(
+    groups: np.ndarray,
+    y_percent: np.ndarray,
+    y_phosphate_g: np.ndarray,
+    y_acidity_ml: np.ndarray,
+) -> np.ndarray:
+    split_label_by_group: Dict[int, int] = {}
+    unique_groups = np.unique(groups)
+
+    for group in unique_groups:
+        mask = groups == group
+        percent_value = float(y_percent[mask].reshape(-1)[0])
+        phosphate_value = float(y_phosphate_g[mask].reshape(-1)[0])
+        acidity_value = float(y_acidity_ml[mask].reshape(-1)[0])
+        if abs(percent_value) > 1e-6:
+            split_label_by_group[int(group)] = 100_000 + int(round(percent_value * 10.0))
+        elif abs(phosphate_value) > 1e-6 or abs(acidity_value) > 1e-6:
+            split_label_by_group[int(group)] = (
+                200_000
+                + int(round(phosphate_value * 1000.0)) * 1000
+                + int(round(acidity_value * 10.0))
+            )
+        else:
+            split_label_by_group[int(group)] = 300_000
+
+    return np.array([split_label_by_group[int(group)] for group in groups], dtype=np.int32)
+
+
+# Elige una fraccion de ejecuciones de cada clase para test o validacion.
+def _take_class_split(groups_by_class: Dict[int, List[int]], fraction: float, rng: np.random.Generator) -> set[int]:
+    selected: set[int] = set()
+    for class_groups in groups_by_class.values():
+        shuffled = np.array(class_groups, dtype=np.int32)
+        rng.shuffle(shuffled)
+        n_groups = len(shuffled)
+        n_take = max(1, int(round(n_groups * fraction)))
+        n_take = min(n_take, max(1, n_groups - 1))
+        selected.update(int(v) for v in shuffled[:n_take])
+    return selected
+
+
+# Divide train/val/test manteniendo juntos todos los barridos de una misma ejecucion.
+def split_by_execution_stratified(
+    groups: np.ndarray,
+    group_class_labels: np.ndarray,
+    test_size: float,
+    val_size: float,
+    random_seed: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    unique_groups = np.unique(groups)
+    if len(unique_groups) < 4:
+        raise ValueError("Se necesitan al menos 4 ejecuciones para train/val/test")
+
+    labels_by_group = []
+    for group in unique_groups:
+        labels = group_class_labels[groups == group].reshape(-1)
+        labels_by_group.append(int(labels[0]))
+    labels_by_group_arr = np.array(labels_by_group, dtype=np.int32)
+
+    _, class_counts = np.unique(labels_by_group_arr, return_counts=True)
+    if np.any(class_counts < 3):
+        raise ValueError(
+            "Cada estrato necesita al menos 3 ejecuciones para hacer split estratificado "
+            f"por grupos. Conteo: {class_counts.tolist()}"
+        )
+
+    rng = np.random.default_rng(random_seed)
+    groups_by_class: Dict[int, List[int]] = {int(c): [] for c in np.unique(labels_by_group_arr)}
+    for group, label in zip(unique_groups, labels_by_group_arr):
+        groups_by_class[int(label)].append(int(group))
+
+    test_groups = _take_class_split(groups_by_class, test_size, rng)
+
+    train_val_groups_by_class: Dict[int, List[int]] = {int(c): [] for c in np.unique(labels_by_group_arr)}
+    for group, label in zip(unique_groups, labels_by_group_arr):
+        if int(group) not in test_groups:
+            train_val_groups_by_class[int(label)].append(int(group))
+
+    relative_val_size = val_size / (1.0 - test_size)
+    val_groups = _take_class_split(train_val_groups_by_class, relative_val_size, rng)
+    train_groups = set(int(v) for v in unique_groups) - test_groups - val_groups
+
+    train_idx = np.array([i for i, g in enumerate(groups) if int(g) in train_groups], dtype=np.int32)
+    val_idx = np.array([i for i, g in enumerate(groups) if int(g) in val_groups], dtype=np.int32)
+    test_idx = np.array([i for i, g in enumerate(groups) if int(g) in test_groups], dtype=np.int32)
+    return train_idx, val_idx, test_idx
+
+
+# Calcula media y desviacion usando solo el conjunto train.
+def compute_norm_stats(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    mean = values.mean(axis=0)
+    std = values.std(axis=0)
+    std[std == 0] = 1.0
+    return mean, std
+
+
+# Escala los datos para que todas las variables tengan magnitudes comparables.
+def normalize(values: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    return (values - mean) / std
+
+
+# Devuelve valores normalizados a la escala real.
+def denormalize(values: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    return values * std + mean
+
+
+# Construye y compila la red neuronal que predice humedad.
 def build_humidity_model(input_dim: int) -> tf.keras.Model:
     regularizer = tf.keras.regularizers.l2(1e-4)
 
@@ -44,6 +255,7 @@ def build_humidity_model(input_dim: int) -> tf.keras.Model:
     return model
 
 
+# Calcula MAE, RMSE y R2 para evaluar la humedad.
 def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     true = y_true.reshape(-1).astype(np.float32)
     pred = y_pred.reshape(-1).astype(np.float32)
@@ -66,43 +278,37 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     }
 
 
+# Ejecuta todo el flujo: carga datos, divide, normaliza, entrena y evalua.
 def main() -> None:
     tf.keras.backend.clear_session()
     tf.random.set_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    json_path = base.resolve_json_path()
+    json_path = resolve_json_path()
     (
         X,
         y_humidity,
-        _y_presence,
-        y_liters,
+        y_percent,
         y_phosphate_g,
         y_acidity_ml,
         groups,
-        _row_info,
-        _execution_summaries,
-    ) = base.load_samples_from_json(
+    ) = load_samples_from_json(
         json_path,
         FEATURES,
-        excluded_execution_indices=base.EXCLUDED_EXECUTION_INDICES,
+        excluded_execution_indices=EXCLUDED_EXECUTION_INDICES,
     )
 
-    y_percent = base.perlite_percentage_from_liters(y_liters)
-
-
-    split_labels = base.build_split_stratification_labels(
+    split_labels = build_split_stratification_labels(
         groups,
         y_percent,
         y_phosphate_g,
         y_acidity_ml,
-        y_humidity,
     )
-    train_idx, val_idx, test_idx = base.split_by_execution_stratified(
+    train_idx, val_idx, test_idx = split_by_execution_stratified(
         groups,
         split_labels,
-        test_size=base.TEST_SIZE,
-        val_size=base.VAL_SIZE,
+        test_size=TEST_SIZE,
+        val_size=VAL_SIZE,
         random_seed=RANDOM_SEED,
     )
 
@@ -110,17 +316,15 @@ def main() -> None:
     y_train, y_val, y_test = y_humidity[train_idx], y_humidity[val_idx], y_humidity[test_idx]
 
     
-    # La normalització es calcula només amb el conjunt d'entrenament
-    x_mean, x_std = base.compute_x_norm_stats(X_train)
-    y_mean, y_std = base.compute_y_norm_stats(y_train)
+    x_mean, x_std = compute_norm_stats(X_train)
+    y_mean, y_std = compute_norm_stats(y_train)
 
-    # S'aplica la mateixa normalització a train, validació i test
-    X_train_n = base.normalize(X_train, x_mean, x_std)
-    X_val_n = base.normalize(X_val, x_mean, x_std)
-    X_test_n = base.normalize(X_test, x_mean, x_std)
+    X_train_n = normalize(X_train, x_mean, x_std)
+    X_val_n = normalize(X_val, x_mean, x_std)
+    X_test_n = normalize(X_test, x_mean, x_std)
 
-    y_train_n = base.normalize(y_train, y_mean, y_std)
-    y_val_n = base.normalize(y_val, y_mean, y_std)
+    y_train_n = normalize(y_train, y_mean, y_std)
+    y_val_n = normalize(y_val, y_mean, y_std)
 
 
     model = build_humidity_model(X_train_n.shape[1])
@@ -152,7 +356,7 @@ def main() -> None:
     )
 
     y_pred_n = model.predict(X_test_n, verbose=0)
-    y_pred = base.denormalize(y_pred_n, y_mean, y_std)
+    y_pred = denormalize(y_pred_n, y_mean, y_std)
     metrics = regression_metrics(y_test, y_pred)
 
     print("Entrenamiento basico solo humedad")
